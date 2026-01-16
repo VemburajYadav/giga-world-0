@@ -16,12 +16,12 @@ def download(model_name: str, save_dir: str = './checkpoints/'):
     if model_name == 'video_pretrain':
         transformer_model_path = download_from_huggingface(
             'open-gigaai/GigaWorld-0-Video-Pretrain-2b',
-            local_dir=save_dir,
+            local_dir=os.path.join(save_dir, 'gigaworld0_video_pretrain_2b'),
         )
     elif model_name == 'video_gr1':
         transformer_model_path = download_from_huggingface(
             'open-gigaai/GigaWorld-0-Video-GR1-2b',
-            local_dir=save_dir,
+            local_dir=os.path.join(save_dir, 'gigaworld0_video_gr1_2b'),
         )
     else:
         assert False
