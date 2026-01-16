@@ -3,13 +3,17 @@ import os
 from typing import List
 
 import imageio
+import math
+import pickle
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import tyro
 from accelerate.utils import set_seed
+from decord import VideoReader, cpu
 from giga_datasets import image_utils
 from giga_datasets import utils as gd_utils
+from glob import glob
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
@@ -70,32 +74,56 @@ def _inference(
                     jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special \
                     effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and \
                     flickering. Overall, the video is of poor quality.'
-    data_list = json.load(open(data_path, 'r'))
-    data_list = gd_utils.split_data(data_list, dp_world_size, dp_rank)
+
+    label_path = os.path.join(data_path, 'labels', 'data.pkl')
+    with open(label_path, 'rb') as f:
+        labels = pickle.load(f)
+    print(labels)
+    prompts = [labels[idx]['prompt'] for idx in range(len(labels))]
+    print(prompts)
+
+    video_paths = glob(os.path.join(data_path, 'videos', 'data', '*.mp4'))
+    video_paths = sorted(video_paths, key=lambda x: int(os.path.basename(x).split('.')[0]))
+
     os.makedirs(save_dir, exist_ok=True)
+
     # Inference loop
-    for n in tqdm(range(len(data_list))):
+    for n in tqdm(range(len(video_paths))):
         set_seed(seed)
-        data_dict = data_list[n]
-        prompt = data_dict['prompt']
-        image_path = data_dict['image']
-        if not os.path.exists(image_path):
-            image_path = os.path.join(os.path.dirname(data_path), image_path)
-        image = Image.open(image_path)
-        image_width, image_height = image.width, image.height
+
+        vr = VideoReader(video_paths[n], ctx=cpu(0))
+        fps = vr.get_avg_fps()
+
+        def get_frame_at_index(vr, idx):
+            frame = vr[idx]                 # decord NDArray, shape (H, W, 3), RGB
+            frame_np = frame.asnumpy()    # convert to NumPy array
+            img = Image.fromarray(frame_np)
+            return img
+        
         # Compute resize/crop to maintain aspect ratio and fit model input
-        dst_width, dst_height = image_utils.get_image_size((image_width, image_height), (width, height), mode='area', multiple=16)
-        if float(dst_height) / image_height < float(dst_width) / image_width:
-            new_height = int(round(float(dst_width) / image_width * image_height))
-            new_width = dst_width
-        else:
-            new_height = dst_height
-            new_width = int(round(float(dst_height) / image_height * image_width))
-        assert dst_width <= new_width and dst_height <= new_height
-        x1 = (new_width - dst_width) // 2
-        y1 = (new_height - dst_height) // 2
-        input_image = F.resize(image, (new_height, new_width), InterpolationMode.BILINEAR)
-        input_image = F.crop(input_image, y1, x1, dst_height, dst_width)
+        def resize_and_crop(img):
+            img_width, img_height = img.width, img.height
+            dst_width, dst_height = image_utils.get_image_size((img_width, img_height), (width, height), mode='area', multiple=16)
+            if float(dst_height) / img_height < float(dst_width) / img_width:
+                new_height = int(round(float(dst_width) / img_width * img_height))
+                new_width = dst_width
+            else:
+                new_height = dst_height
+                new_width = int(round(float(dst_height) / img_height * img_width))
+            assert dst_width <= new_width and dst_height <= new_height
+            x1 = (new_width - dst_width) // 2
+            y1 = (new_height - dst_height) // 2
+            resiyed_img = F.resize(img, (new_height, new_width), InterpolationMode.BILINEAR)
+            cropped_img = F.crop(resiyed_img, y1, x1, dst_height, dst_width)
+
+            return cropped_img, dst_height, dst_width
+
+        image = get_frame_at_index(vr, 0)
+        prompt = prompts[n]
+
+        print(f"{n} prompt: {prompt}")
+        input_image, dst_height, dst_width = resize_and_crop(image)
+
         # Run the pipeline
         output_images = pipe(
             prompt=prompt,
@@ -113,7 +141,9 @@ def _inference(
             vis_images = []
             for k in range(len(output_images)):
                 if image is not None:
-                    vis_image = [input_image, output_images[k]]
+                    gt_img = get_frame_at_index(vr, math.floor(int(k * len(vr) / len(output_images))))
+                    gt_img, _, _ = resize_and_crop(gt_img)
+                    vis_image = [gt_img, output_images[k]]
                 else:
                     vis_image = [output_images[k]]
                 vis_image = image_utils.concat_images_grid(vis_image, cols=2, pad=2)
