@@ -80,26 +80,44 @@ class GigaWorld0Trainer(Trainer):
         prompt_embeds = batch_dict['prompt_embeds']
         batch_size = images.shape[0]
 
+        print(f"images shape: {images.shape}, prompt_embeds shape: {prompt_embeds.shape}")
+
         padding_mask = torch.zeros((batch_size, 1, images.shape[-2], images.shape[-1]), dtype=self.dtype, device=self.device)
         fps = batch_dict['fps'][0]
 
+        print(f"fps: {fps}")
         latents = self.forward_vae(images)
+        print(f"latents shape: {latents.shape}")
         input_latents, timesteps = self.edm_loss.add_noise(latents)
-
+        print(f"input latents shape: {input_latents.shape}, timesteps shape: {timesteps.shape}")
+        print(f"timesteps: {timesteps}")
         ref_images = batch_dict['ref_images']
         ref_masks = batch_dict['ref_masks'].to(self.dtype)
+
+        print(f"ref images shape: {ref_images.shape}, ref masks shape: {ref_masks.shape}")
+        diff = torch.max(torch.abs(images - ref_images))
+        print(f"max abs diff between images and ref_images: {diff}")
         ref_latents = self.forward_vae(ref_images)
+        print(f"ref latents shape: {ref_latents.shape}")
 
         augment_sigma = torch.tensor([0.0001], device=ref_latents.device, dtype=latents.dtype)
         while len(augment_sigma.shape) < len(ref_latents.shape):
             augment_sigma = augment_sigma.unsqueeze(-1)
 
         input_latents = ref_masks * ref_latents + (1 - ref_masks) * input_latents
+        print(f"input_latents after ref_images shape: {input_latents.shape}")
         input_masks = ref_masks.repeat(1, 1, 1, input_latents.shape[-2], input_latents.shape[-1])
+        print(f"input_masks shape: {input_masks.shape}")
         input_latents = torch.cat([input_latents, input_masks], dim=1)
+        print(f"input_latents after concat shape: {input_latents.shape}")
         timesteps = timesteps.view(1, 1, 1, 1, 1).expand(latents.size(0), -1, latents.size(2), -1, -1)
+        print(f"timesteps after view shape: {timesteps.shape}")
+        # timesteps = timesteps.view(latents.size(0), 1, 1, 1, 1).expand(-1, -1, latents.size(2), -1, -1)
+
         t_conditioning = augment_sigma / (augment_sigma + 1)
+        print(f"t_conditioning shape: {t_conditioning.shape}, t_conditioning: {t_conditioning}")
         timesteps = ref_masks * t_conditioning + (1 - ref_masks) * timesteps
+        print(f"timesteps after ref_images shape: {timesteps.shape}")
 
         input_latents = input_latents.to(self.dtype)
         timesteps = timesteps.to(self.dtype)
@@ -113,10 +131,16 @@ class GigaWorld0Trainer(Trainer):
             padding_mask=padding_mask,
             fps=fps,
         )
+
+        print(f"model_pred shape: {model_pred.shape}")
         denoised_latents = self.edm_loss.denoise(model_pred.float())
+        print(f"denoised_latents shape: {denoised_latents.shape}")
         if 'ref_images' in batch_dict:
             denoised_latents = ref_masks * ref_latents + (1 - ref_masks) * denoised_latents
+            print(f"denoised_latents after ref_images shape: {denoised_latents.shape}")
         loss = self.edm_loss.compute_loss(denoised_latents)
+        print(f"loss: {loss}")
+        exit()
         return loss
 
     def forward_vae(self, images):

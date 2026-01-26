@@ -20,6 +20,7 @@ def pack_data_lerobot(
     device: str = 'cuda',
     sample_only: int | None = None,
     generate_train_val_test_splits: bool = False,
+    split_info: str | None = None,
 ):
     """Pack LeRobot videos, prompts, and prompt embeddings into a dataset for training
     or evaluation.
@@ -43,7 +44,23 @@ def pack_data_lerobot(
     if sample_only is not None:
         video_paths = video_paths[:sample_only]
 
-    if generate_train_val_test_splits:
+    if split_info is not None:
+        with open(split_info, 'r') as f:
+            split_indices = json.load(f)
+        splits = {}
+        for split_name, indices in split_indices.items():
+            splits[split_name] = {
+                'video_paths': [video_paths[idx] for idx in indices],
+                'save_dir': os.path.join(save_dir, split_name)
+            }
+        print(f'Split info loaded from {split_info}:')
+        for split_name, split_data in splits.items():
+            print(f'  {split_name}: {len(split_data["video_paths"])} videos')
+
+        with open(os.path.join(save_dir, 'split_indices.json'), 'w') as f:
+            json.dump(split_indices, f)
+
+    elif generate_train_val_test_splits:
         num_videos = len(video_paths)
         shuffled_indices = list(range(num_videos))
         random.shuffle(shuffled_indices)
@@ -53,9 +70,9 @@ def pack_data_lerobot(
 
         with open(os.path.join(save_dir, 'split_indices.json'), 'w') as f:
             json.dump({
-                'train_indices': train_indices,
-                'val_indices': val_indices,
-                'test_indices': test_indices
+                'train': train_indices,
+                'val': val_indices,
+                'test': test_indices
             }, f)
 
         splits = {
@@ -76,6 +93,9 @@ def pack_data_lerobot(
     else:
         splits = {'all': {'video_paths': video_paths, 'save_dir': save_dir}}
 
+    print(f'Total training episodes: {len(splits["train"]["video_paths"]) if "train" in splits else len(video_paths)}')
+    print(f'Total validation episodes: {len(splits["val"]["video_paths"]) if "val" in splits else 0}')
+    print(f'Total testing episodes: {len(splits["test"]["video_paths"]) if "test" in splits else 0}')
 
     ann_file = os.path.join(video_dir, 'meta', 'episodes.jsonl')
     if not os.path.exists(ann_file):
@@ -88,44 +108,47 @@ def pack_data_lerobot(
             prompts[record["episode_index"]] = " ".join(record["tasks"])
 
     for split_name, split_info in splits.items():
-        video_paths_split = split_info['video_paths']
-        save_dir_split = split_info['save_dir']
-        os.makedirs(save_dir_split, exist_ok=True)
-        print(f'Processing split: {split_name}, number of videos: {len(video_paths_split)}')
+        if split_name == 'test':
+            video_paths_split = split_info['video_paths']
+            save_dir_split = split_info['save_dir']
+            os.makedirs(save_dir_split, exist_ok=True)
+            print(f'Processing split: {split_name}, number of videos: {len(video_paths_split)}')
 
-        # Writers for labels, videos, and prompt embeddings
-        label_writer = PklWriter(os.path.join(save_dir_split , 'labels'))
-        video_writer = FileWriter(os.path.join(save_dir_split, 'videos'))
-        prompt_writer = FileWriter(os.path.join(save_dir_split, 'prompts'))
+            # Writers for labels, videos, and prompt embeddings
+            label_writer = PklWriter(os.path.join(save_dir_split , 'labels'))
+            video_writer = FileWriter(os.path.join(save_dir_split, 'videos'))
+            prompt_writer = FileWriter(os.path.join(save_dir_split, 'prompts'))
 
-        for idx in tqdm(range(len(video_paths_split))):
-            video_path = video_paths_split[idx]
-            episode_index = int(os.path.basename(video_path).split('_')[1].split('.')[0])
-            prompt = prompts[episode_index]
+            for idx in tqdm(range(len(video_paths_split))):
+                video_path = video_paths_split[idx]
+                episode_index = int(os.path.basename(video_path).split('_')[1].split('.')[0])
+                prompt = prompts[episode_index]
+                prompt = prompt.replace('a Cotton Swab', 'the Cotton Swab')
+                prompt = prompt.replace('a Cloth', 'the Cloth')
+                print(f'Processing video: {video_path}, prompt: {prompt}, episode_index: {episode_index}')
+                # Encode the prompt to get embeddings
+                prompt_embeds = text_encoder.encode_prompts(prompt)[0].cpu()
 
-            # Encode the prompt to get embeddings
-            prompt_embeds = text_encoder.encode_prompts(prompt)[0].cpu()
+                label_dict = dict(data_index=idx, prompt=prompt)
+                label_writer.write_dict(label_dict)
+                video_writer.write_video(idx, video_paths_split[idx])
+                prompt_writer.write_dict(idx, dict(prompt_embeds=prompt_embeds))
 
-            label_dict = dict(data_index=idx, prompt=prompt)
-            label_writer.write_dict(label_dict)
-            video_writer.write_video(idx, video_paths_split[idx])
-            prompt_writer.write_dict(idx, dict(prompt_embeds=prompt_embeds))
+            # Finalize and close writers
+            label_writer.write_config()
+            video_writer.write_config()
+            prompt_writer.write_config()
+            label_writer.close()
+            video_writer.close()
+            prompt_writer.close()
 
-        # Finalize and close writers
-        label_writer.write_config()
-        video_writer.write_config()
-        prompt_writer.write_config()
-        label_writer.close()
-        video_writer.close()
-        prompt_writer.close()
-
-        # Load datasets and combine into a single Dataset object
-        label_dataset = load_dataset(os.path.join(save_dir_split, 'labels'))
-        video_dataset = load_dataset(os.path.join(save_dir_split, 'videos'))
-        prompt_dataset = load_dataset(os.path.join(save_dir_split, 'prompts'))
-        dataset = Dataset([label_dataset, video_dataset, prompt_dataset])
-        dataset.save(save_dir_split)
-    
+            # Load datasets and combine into a single Dataset object
+            label_dataset = load_dataset(os.path.join(save_dir_split, 'labels'))
+            video_dataset = load_dataset(os.path.join(save_dir_split, 'videos'))
+            prompt_dataset = load_dataset(os.path.join(save_dir_split, 'prompts'))
+            dataset = Dataset([label_dataset, video_dataset, prompt_dataset])
+            dataset.save(save_dir_split)
+        
 
 
 def pack_data(
@@ -180,4 +203,4 @@ def pack_data(
 
 
 if __name__ == '__main__':
-    tyro.cli(pack_data)
+    tyro.cli(pack_data_lerobot)

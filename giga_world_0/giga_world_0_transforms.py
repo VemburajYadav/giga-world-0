@@ -45,16 +45,25 @@ class GigaWorld0Transform:
             new_data_dict: Transformed data dictionary with processed images and masks.
         """
         video = data_dict['video']
-        video_legnth = len(video)
-        sample_indexes = np.linspace(0, video_legnth - 1, self.num_frames, dtype=int)
+        video_length = len(video)
+
+        print("=== GigaWorld0Transform ===")
+        # Sampling num_frames frames within a constant temporal window) 
+        # starting_idx = random.randint(0, max(0, video_length - self.num_frames))
+        # sample_indexes = np.arange(starting_idx, starting_idx + self.num_frames)
+        sample_indexes = np.linspace(0, video_length - 1, self.num_frames, dtype=int)
+        # print(f"sample indexes: {sample_indexes}")
+        # print(f"video length: {video_length}")
         input_images = video_utils.sample_video(video, sample_indexes, method=2)
+
         # Convert to tensor and rearrange dimensions: (T, H, W, C) -> (T, C, H, W)
         input_images = torch.from_numpy(input_images).permute(0, 3, 1, 2).contiguous()
 
         image_height = input_images.shape[2]
         image_width = input_images.shape[3]
         dst_width, dst_height = self.width, self.height
-
+        print(f"image_width: {image_width}, image_height: {image_height}")
+        print(f"dst_width: {dst_width}, dst_height: {dst_height}")
         # Calculate new dimensions maintaining aspect ratio
         if float(dst_height) / image_height < float(dst_width) / image_width:
             new_height = int(round(float(dst_width) / image_width * image_height))
@@ -80,14 +89,19 @@ class GigaWorld0Transform:
         # ===== Generate Reference Images and Masks =====
         # Get masks for reference frames
         ref_masks, ref_latent_masks = self.mask_generator.get_mask(input_images.shape[0])
+        print(f"ref masks shape: {ref_masks.shape}, ref_latent_masks shape: {ref_latent_masks.shape}")
+        print(f"ref_masks: {ref_masks}, ref_latent_masks: {ref_latent_masks}")
         # Expand dimensions for broadcasting: (T,) -> (T, 1, 1, 1)
         ref_masks = ref_masks[:, None, None, None]
         # Expand for latent space: (T_latent,) -> (1, T_latent, 1, 1)
         ref_latent_masks = ref_latent_masks[None, :, None, None]
+
+        print(f"Ref masks after unsqueeze shape: {ref_masks.shape}, ref_latent_masks after unsqueeze shape: {ref_latent_masks.shape}")
         # Create reference images by masking
         ref_images = copy.deepcopy(input_images)
         ref_images = ref_images * ref_masks
 
+        print(f"Input images shape: {input_images.shape}, Ref images shape: {ref_images.shape}")
         new_data_dict = dict(
             fps=self.fps,
             images=input_images,
@@ -95,6 +109,8 @@ class GigaWorld0Transform:
             ref_masks=ref_latent_masks,
             prompt_embeds=data_dict['prompt_embeds'],
         )
+
+        print("=== End of GigaWorld0Transform ===")
         return new_data_dict
 
 

@@ -42,6 +42,7 @@ def _inference(
     dp_world_size: int = 1,
     dp_rank: int = 0,
     process_index: int = 0,
+    autoregressive: bool = False,
 ):
     """Run inference on a split of the dataset using a single device
     (optionally as part of DP/SP setup).
@@ -56,6 +57,7 @@ def _inference(
         num_inference_steps, fps, num_frames, height, width, seed: Generation parameters.
         dp_world_size, dp_rank: Data parallel world size and rank.
         process_index: Index for multi-process setups.
+        autoregressive: Whether to use autoregressive generation.
     """
     torch.cuda.set_device(device)
     # Load the GigaWorld0 pipeline
@@ -66,7 +68,15 @@ def _inference(
         lora_model_path=lora_model_path,
         lora_fuse=lora_fuse,
     )
+    # pipe_with_lora_fuse = GigaWorld0Pipeline.from_pretrained(
+    #     transformer_model_path=transformer_model_path,
+    #     text_encoder_model_path=text_encoder_model_path,
+    #     vae_model_path=vae_model_path,
+    #     lora_model_path=lora_model_path,
+    #     lora_fuse=True,
+    # )
     pipe.to(device)
+    # pipe_with_lora_fuse.to(device)
     # Load and split data for this process
     negative_prompt = 'The video captures a series of frames showing ugly scenes, static with no motion, motion blur, \
                     over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, \
@@ -88,11 +98,11 @@ def _inference(
     os.makedirs(save_dir, exist_ok=True)
 
     # Inference loop
-    for n in tqdm(range(len(video_paths))):
+    for n in tqdm(range(0, len(video_paths), 10)):
         set_seed(seed)
 
         vr = VideoReader(video_paths[n], ctx=cpu(0))
-        fps = vr.get_avg_fps()
+        fps_gt = vr.get_avg_fps()
 
         def get_frame_at_index(vr, idx):
             frame = vr[idx]                 # decord NDArray, shape (H, W, 3), RGB
@@ -121,35 +131,114 @@ def _inference(
         image = get_frame_at_index(vr, 0)
         prompt = prompts[n]
 
+        # prompt = prompt.replace('a Cotton Swab', 'the Cotton Swab')
+        # prompt = prompt.replace('a Cloth', 'the Cloth')
         print(f"{n} prompt: {prompt}")
+        print(f"Original image size: {image.size}")
         input_image, dst_height, dst_width = resize_and_crop(image)
+        print(f"Input image size: {input_image.size}, resized to: ({dst_width}, {dst_height})")
+        episode_frame_count = len(vr)
+        print(f"Video has {episode_frame_count} frames at {fps} fps.")
 
         # Run the pipeline
-        output_images = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            image=input_image,
-            num_inference_steps=num_inference_steps,
-            fps=fps,
-            num_frames=num_frames,
-            height=dst_height,
-            width=dst_width,
-            seed=seed,
-        )[0]
-        # Save results (only on main process)
-        if process_index == 0:
-            vis_images = []
-            for k in range(len(output_images)):
-                if image is not None:
-                    gt_img = get_frame_at_index(vr, math.floor(int(k * len(vr) / len(output_images))))
-                    gt_img, _, _ = resize_and_crop(gt_img)
-                    vis_image = [gt_img, output_images[k]]
+        if autoregressive:
+            output_images = []
+            num_ar_steps = math.ceil(episode_frame_count / (num_frames - 1))
+            for ar_step in range(num_ar_steps):
+                print(f"AR step {ar_step+1}/{num_ar_steps}")
+                ar_input_image = input_image
+                if ar_step > 0:
+                    ar_input_image = ar_output_images[-1]
+                    # ar_input_frame_idx = ar_step * num_frames - 1
+                    # if ar_input_frame_idx >= episode_frame_count:
+                    #     ar_input_frame_idx = episode_frame_count - 1
+                    # ar_input_image = get_frame_at_index(vr, ar_input_frame_idx)
+                    # ar_input_image, _, _ = resize_and_crop(ar_input_image)
+                ar_output_images = pipe(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    image=ar_input_image,
+                    num_inference_steps=num_inference_steps,
+                    fps=fps,
+                    num_frames=num_frames,
+                    height=dst_height,
+                    width=dst_width,
+                    seed=seed + ar_step,
+                )[0]
+                print(type(ar_output_images), len(ar_output_images))
+                if ar_step == (num_ar_steps - 1):
+                    output_images.extend(ar_output_images)
                 else:
-                    vis_image = [output_images[k]]
-                vis_image = image_utils.concat_images_grid(vis_image, cols=2, pad=2)
-                vis_images.append(vis_image)
-            save_path = os.path.join(save_dir, f'{n}.mp4')
-            imageio.mimsave(save_path, vis_images, fps=fps)
+                    output_images.extend(ar_output_images[:-1])
+                print(f"Total generated frames: {len(output_images)}")
+            output_images = output_images[:episode_frame_count]
+            print(f"Generated {len(output_images)} frames, expected {episode_frame_count} frames.")
+
+            # save ground truth video
+            if process_index == 0:
+                gt_images = []
+                for k in range(episode_frame_count):
+                    gt_img = get_frame_at_index(vr, k)
+                    gt_img, _, _ = resize_and_crop(gt_img)
+                    gt_images.append(gt_img)
+                save_path = os.path.join(save_dir, f'{n}_gt.mp4')
+                imageio.mimsave(save_path, gt_images, fps=fps_gt)
+
+                # save generated video
+                vis_images = []
+                for k in range(episode_frame_count):
+                    vis_image = output_images[k]
+                    vis_images.append(vis_image)
+                save_path = os.path.join(save_dir, f'{n}.mp4')
+                imageio.mimsave(save_path, vis_images, fps=fps)
+        else:
+            output_images = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=input_image,
+                num_inference_steps=num_inference_steps,
+                fps=fps,
+                num_frames=num_frames,
+                height=dst_height,
+                width=dst_width,
+                seed=seed,
+            )[0]
+
+            # output_images_lora_fuse = pipe_with_lora_fuse(
+            #     prompt=prompt,
+            #     negative_prompt=negative_prompt,
+            #     image=input_image,
+            #     num_inference_steps=num_inference_steps,
+            #     fps=fps,
+            #     num_frames=num_frames,
+            #     height=dst_height,
+            #     width=dst_width,
+            #     seed=seed,
+            # )[0]
+            # import numpy as np
+            # np_arrays = []
+            # for i in range(len(output_images_lora_fuse)):
+            #     np_arrays.append(np.array(output_images_lora_fuse[i]))
+            # np_arrays = np.concatenate([arr[None] for arr in np_arrays], axis=0)  # (T, H, W, C)
+            # np.savez_compressed('output_images_lora_fuse.npz', videos=np_arrays)
+
+            # Save results (only on main process)
+            if process_index == 0:
+                gt_images = []
+                for k in range(episode_frame_count):
+                    gt_img = get_frame_at_index(vr, k)
+                    gt_img, _, _ = resize_and_crop(gt_img)
+                    gt_images.append(gt_img)
+                save_path = os.path.join(save_dir, f'{n}_gt.mp4')
+                imageio.mimsave(save_path, gt_images, fps=fps_gt)
+
+                # save generated video
+                vis_images = []
+                for k in range(len(output_images)):
+                    vis_image = output_images[k]
+                    vis_images.append(vis_image)
+                save_path = os.path.join(save_dir, f'{n}.mp4')
+                imageio.mimsave(save_path, vis_images, fps=fps)
 
 
 def _inference_sp(rank, gpu_ids, sp_size, port, kwargs):
@@ -199,6 +288,7 @@ def inference(
     height: int = 480,
     width: int = 640,
     seed: int = 6666,
+    autoregressive: bool = False,
 ):
     """Main entry point for inference.
 
